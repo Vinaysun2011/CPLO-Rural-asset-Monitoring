@@ -35,6 +35,16 @@ Deploy the same folder to Render, Railway or a small VPS, set the values from `.
 environment variables there, and use `python app.py` as the start command.
 Your database must allow connections from that host's IP address.
 
+## What the portal shows
+Three tabs: **District wise**, **Block wise**, **Panchayat wise**. Pick a district / block to narrow the view.
+- `report.sql` is the panchayat-wise query (one row per panchayat). Block and district totals are
+  added up from those rows, so one database query feeds all three levels.
+- **Download Excel (this tab)** gives the current level; **Download Excel (all 3 levels)** gives one file
+  with three sheets. Filters apply to both. The Excel file always has every row; the screen shows the
+  first 1,000 panchayats (set `SCREEN_ROW_LIMIT` to change).
+- `report_original_panchayat.sql` is your original query; `old_queries/` holds the earlier district query.
+- `suggested_indexes.sql` lists indexes that make the query faster (ask your DBA to run them).
+
 ## Notes
 - Every "Generate / Refresh" click runs the SQL live. Results are reused for `CACHE_SECONDS`
   (default 60) so many users don't overload the database.

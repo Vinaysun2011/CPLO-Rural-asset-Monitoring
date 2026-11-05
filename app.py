@@ -10,6 +10,7 @@ import pymysql
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_file, session
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -23,7 +24,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),  # https only when on Vercel
 )
 
-# ---- config (all from .env, never hard-coded) ----
+# ---- config (all from .env / Vercel settings, never hard-coded) ----
 DB = dict(
     host=os.environ["DB_HOST"],
     port=int(os.environ.get("DB_PORT", "3306")),
@@ -35,6 +36,7 @@ DB = dict(
     charset="utf8mb4",
 )
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "60"))
+SCREEN_ROW_LIMIT = int(os.environ.get("SCREEN_ROW_LIMIT", "1000"))  # rows shown on screen
 
 # APP_USERS="client1:pass1,client2:pass2"
 USERS = dict(
@@ -43,6 +45,15 @@ USERS = dict(
 
 with open(os.path.join(os.path.dirname(__file__), "report.sql"), encoding="utf-8") as f:
     SQL = f.read()
+
+# The SQL returns one row per panchayat. Columns 0-4 are labels, the rest are numbers.
+N_LABEL = 5
+I_DISTRICT, I_BLOCK, I_PID, I_SURVEY = 0, 1, 3, 4
+LEVELS = {
+    "district": "District wise",
+    "block": "Block wise",
+    "panchayat": "Panchayat wise",
+}
 
 _cache = {"ts": 0, "data": None}
 _lock = threading.Lock()
@@ -54,9 +65,9 @@ def _clean(v):
     return v
 
 
-def fetch_report(force=False):
-    """Run the SQL (read-only) and return the rows. Cached briefly so many
-    clients opening the page do not hammer the database."""
+def fetch_base(force=False):
+    """Run the SQL once (read-only) and cache it briefly. District and block
+    reports are calculated from these panchayat rows, so one query serves all."""
     with _lock:
         if not force and _cache["data"] and time.time() - _cache["ts"] < CACHE_SECONDS:
             return _cache["data"]
@@ -73,29 +84,76 @@ def fetch_report(force=False):
             "rows": rows,
             "generated_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
         }
-        data["totals"] = build_totals(columns, rows)
         _cache.update(ts=time.time(), data=data)
         return data
 
 
-def build_totals(columns, rows):
-    totals = ["Total"]
-    for i in range(1, len(columns)):
-        vals = [r[i] for r in rows]
-        if all(isinstance(v, (int, float)) or v is None for v in vals):
-            totals.append(sum(v or 0 for v in vals))
-        else:
-            totals.append("")
-    # recompute the percentage column from the totals
-    try:
-        pct_i = next(i for i, c in enumerate(columns) if c.startswith("%age"))
-        tot_i = columns.index("Total_panchayats")
-        not_i = columns.index("GPs_who_Not_Uploaded_any_assets")
-        if totals[tot_i]:
-            totals[pct_i] = f"{round((totals[tot_i] - totals[not_i]) / totals[tot_i] * 100, 1)}%"
-    except (StopIteration, ValueError):
-        pass
-    return totals
+def _sort_key(key):
+    return tuple("" if v is None else str(v).lower() for v in key)
+
+
+def rollup(base, key_idx, key_names, rows):
+    """Add up panchayat rows by district (or district+block)."""
+    num_names = base["columns"][N_LABEL:]
+    groups = {}
+    for r in rows:
+        key = tuple(r[i] for i in key_idx)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"ids": set(), "started": set(), "sums": [0] * len(num_names)}
+        g["ids"].add(r[I_PID])
+        if r[I_SURVEY] == "Yes":
+            g["started"].add(r[I_PID])
+        for j, v in enumerate(r[N_LABEL:]):
+            g["sums"][j] += v or 0
+    out = []
+    for key in sorted(groups, key=_sort_key):
+        g = groups[key]
+        total, started = len(g["ids"]), len(g["started"])
+        pct = round(started / total * 100, 1) if total else 0
+        out.append(list(key) + [total, started, total - started, pct] + g["sums"])
+    columns = list(key_names) + [
+        "Total_panchayats",
+        "GPs_Survey_Started",
+        "GPs_Survey_Not_Started",
+        "%age of GPs (Survey Started)",
+    ] + num_names
+    return columns, out
+
+
+def build_total(columns, rows, n_label):
+    """Total row: adds every number column, recomputes the % column."""
+    tot = ["Total"] + [""] * (n_label - 1)
+    for i in range(n_label, len(columns)):
+        tot.append(sum((r[i] or 0) for r in rows if isinstance(r[i], (int, float))))
+    for i, c in enumerate(columns):
+        if c.startswith("%age"):
+            t = tot[columns.index("Total_panchayats")]
+            s = tot[columns.index("GPs_Survey_Started")]
+            tot[i] = round(s / t * 100, 1) if t else 0
+    return tot
+
+
+def get_level(level, district=None, block=None, force=False):
+    """Returns columns, rows, total, n_label for one report level."""
+    base = fetch_base(force)
+    rows = base["rows"]
+    if district:
+        rows = [r for r in rows if r[I_DISTRICT] == district]
+    if block:
+        rows = [r for r in rows if r[I_BLOCK] == block]
+    if level == "district":
+        columns, out = rollup(base, [I_DISTRICT], ["District"], rows)
+        n_label = 1
+    elif level == "block":
+        columns, out = rollup(base, [I_DISTRICT, I_BLOCK], ["District", "Block_name"], rows)
+        n_label = 2
+    else:
+        columns, out, n_label = base["columns"], rows, N_LABEL
+    total = build_total(columns, out, n_label)
+    if level == "panchayat":  # show number of panchayats that started the survey
+        total[I_SURVEY] = f"{sum(1 for r in out if r[I_SURVEY] == 'Yes')} Yes"
+    return columns, out, total, n_label, base["generated_at"]
 
 
 def login_required(fn):
@@ -133,60 +191,119 @@ def me():
     return jsonify(user=session.get("user"))
 
 
+def _args():
+    level = request.args.get("level", "district")
+    if level not in LEVELS and level != "all":
+        level = "district"
+    return (
+        level,
+        request.args.get("district") or None,
+        request.args.get("block") or None,
+        request.args.get("fresh") == "1",
+    )
+
+
 @app.get("/api/report")
 @login_required
 def report():
+    level, district, block, fresh = _args()
     try:
-        return jsonify(fetch_report(force=request.args.get("fresh") == "1"))
+        columns, rows, total, n_label, gen = get_level(
+            level if level != "all" else "district", district, block, fresh
+        )
+        base = fetch_base()
     except Exception as e:  # show a readable message, not a stack trace
         return jsonify(error=f"Could not read the database: {e}"), 500
+    # drop-down choices
+    blocks = {}
+    for r in base["rows"]:
+        blocks.setdefault(r[I_DISTRICT], set()).add(r[I_BLOCK])
+    filters = {
+        "districts": sorted((d for d in blocks if d is not None), key=str.lower),
+        "blocks": {d: sorted((b for b in bs if b is not None), key=str.lower)
+                   for d, bs in blocks.items() if d is not None},
+    }
+    shown = rows[:SCREEN_ROW_LIMIT]
+    return jsonify(
+        columns=columns,
+        rows=shown,
+        total=total,
+        n_label=n_label,
+        row_count=len(rows),
+        truncated=len(rows) > len(shown),
+        generated_at=gen,
+        filters=filters,
+    )
+
+
+def _write_sheet(wb, title, columns, rows, total, n_label, gen):
+    ws = wb.create_sheet(title)
+    big = len(rows) > 5000  # keep large sheets light so the file builds quickly
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    tot_font = Font(bold=True)
+    tot_fill = PatternFill("solid", fgColor="DDEBF7")
+
+    for i in range(1, len(columns) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 24 if i <= n_label else 16
+    ws.freeze_panes = f"{get_column_letter(n_label + 1)}4"
+
+    ws.append([f"{title} - report generated: {gen}"])
+    ws.append([])
+
+    hdr = []
+    for c in columns:
+        cell = WriteOnlyCell(ws, value=c)
+        cell.font, cell.fill, cell.border = head_font, head_fill, border
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        hdr.append(cell)
+    ws.append(hdr)
+
+    for r in rows:
+        if big:
+            ws.append(r)
+            continue
+        line = []
+        for ci, v in enumerate(r):
+            cell = WriteOnlyCell(ws, value=v)
+            cell.border = border
+            if columns[ci] == "PanchayatId":
+                pass  # an ID, not a quantity: no thousands separator
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                cell.number_format = "#,##0.0" if isinstance(v, float) else "#,##0"
+            line.append(cell)
+        ws.append(line)
+
+    line = []
+    for v in total:
+        cell = WriteOnlyCell(ws, value=v)
+        cell.font, cell.fill, cell.border = tot_font, tot_fill, border
+        if isinstance(v, (int, float)):
+            cell.number_format = "#,##0.0" if isinstance(v, float) else "#,##0"
+        line.append(cell)
+    ws.append(line)
 
 
 @app.get("/api/report.xlsx")
 @login_required
 def report_xlsx():
+    level, district, block, fresh = _args()
+    levels = list(LEVELS) if level == "all" else [level]
+    wb = Workbook(write_only=True)
     try:
-        data = fetch_report(force=request.args.get("fresh") == "1")
+        for i, lv in enumerate(levels):
+            columns, rows, total, n_label, gen = get_level(lv, district, block, fresh and i == 0)
+            _write_sheet(wb, LEVELS[lv], columns, rows, total, n_label, gen)
     except Exception as e:
         return jsonify(error=f"Could not read the database: {e}"), 500
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Report"
-    ws.append([f"Report generated: {data['generated_at']}"])
-    ws["A1"].font = Font(italic=True)
-    ws.append([])
-    ws.append(data["columns"])
-
-    thin = Side(style="thin", color="BBBBBB")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for c in ws[3]:
-        c.font = Font(bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor="1F4E78")
-        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
-        c.border = border
-    ws.row_dimensions[3].height = 48
-
-    for r in data["rows"]:
-        ws.append(r)
-    ws.append(data["totals"])
-    for c in ws[ws.max_row]:
-        c.font = Font(bold=True)
-        c.fill = PatternFill("solid", fgColor="DDEBF7")
-
-    for row in ws.iter_rows(min_row=4, max_row=ws.max_row):
-        for c in row:
-            c.border = border
-            if isinstance(c.value, (int, float)):
-                c.number_format = "#,##0"
-    for i, col in enumerate(data["columns"], start=1):
-        ws.column_dimensions[get_column_letter(i)].width = 22 if i == 1 else 16
-    ws.freeze_panes = "B4"
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    name = f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    part = "all_levels" if level == "all" else level
+    name = f"report_{part}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     return send_file(
         buf,
         as_attachment=True,
