@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset Report</title>
+<style>
+  :root { --blue:#1f4e78; --bg:#f4f6f9; --line:#d9dee5; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,Arial,sans-serif; background:var(--bg); color:#222; }
+  header { background:var(--blue); color:#fff; padding:14px 20px; display:flex; align-items:center; justify-content:space-between; }
+  header h1 { margin:0; font-size:18px; font-weight:600; }
+  main { padding:20px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  button { background:var(--blue); color:#fff; border:0; padding:9px 16px; border-radius:6px; font-size:14px; cursor:pointer; }
+  button.secondary { background:#fff; color:var(--blue); border:1px solid var(--blue); }
+  button:disabled { opacity:.5; cursor:default; }
+  .muted { color:#666; font-size:13px; }
+  .wrap { overflow:auto; background:#fff; border:1px solid var(--line); border-radius:8px; max-height:75vh; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; text-align:right; }
+  th { position:sticky; top:0; background:var(--blue); color:#fff; white-space:normal; text-align:center; min-width:110px; }
+  th:first-child, td:first-child { text-align:left; position:sticky; left:0; background:#fff; }
+  th:first-child { background:var(--blue); z-index:2; }
+  tr.total td { font-weight:700; background:#ddebf7; }
+  tr:hover td { background:#f1f7fd; }
+  tr.total:hover td { background:#ddebf7; }
+  .card { max-width:340px; margin:80px auto; background:#fff; padding:28px; border-radius:10px; border:1px solid var(--line); }
+  .card h2 { margin-top:0; }
+  input { width:100%; padding:10px; margin:6px 0 14px; border:1px solid #bbb; border-radius:6px; font-size:14px; }
+  .err { color:#b00020; font-size:14px; margin-bottom:10px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+
+<div id="loginView" class="hidden">
+  <div class="card">
+    <h2>Sign in</h2>
+    <div id="loginErr" class="err"></div>
+    <label>Username<input id="u" autocomplete="username"></label>
+    <label>Password<input id="p" type="password" autocomplete="current-password"></label>
+    <button id="loginBtn" style="width:100%">Sign in</button>
+  </div>
+</div>
+
+<div id="appView" class="hidden">
+  <header>
+    <h1>Asset Report</h1>
+    <button class="secondary" id="logoutBtn">Sign out</button>
+  </header>
+  <main>
+    <div class="bar">
+      <button id="refreshBtn">Generate / Refresh</button>
+      <button id="xlsBtn" class="secondary" disabled>Download Excel</button>
+      <span class="muted" id="status"></span>
+    </div>
+    <div id="error" class="err"></div>
+    <div class="wrap"><table id="tbl"></table></div>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = v => typeof v === 'number' ? v.toLocaleString('en-IN') : (v ?? '');
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && path !== '/api/login') { show(false); throw new Error('Please sign in'); }
+  if (!r.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+
+function show(loggedIn) {
+  $('loginView').classList.toggle('hidden', loggedIn);
+  $('appView').classList.toggle('hidden', !loggedIn);
+}
+
+function render(d) {
+  const head = '<tr>' + d.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+  const body = d.rows.map(r => '<tr>' + r.map(v => `<td>${fmt(v)}</td>`).join('') + '</tr>').join('');
+  const tot = '<tr class="total">' + d.totals.map(v => `<td>${fmt(v)}</td>`).join('') + '</tr>';
+  $('tbl').innerHTML = `<thead>${head}</thead><tbody>${body}${tot}</tbody>`;
+  $('status').textContent = 'Data as of ' + d.generated_at;
+  $('xlsBtn').disabled = false;
+}
+
+async function load(fresh) {
+  $('error').textContent = '';
+  $('refreshBtn').disabled = true;
+  $('status').textContent = 'Loading from database...';
+  try { render(await api('/api/report' + (fresh ? '?fresh=1' : ''))); }
+  catch (e) { $('error').textContent = e.message; $('status').textContent = ''; }
+  $('refreshBtn').disabled = false;
+}
+
+$('refreshBtn').onclick = () => load(true);
+$('xlsBtn').onclick = () => { location.href = '/api/report.xlsx'; };
+$('logoutBtn').onclick = async () => { await api('/api/logout', {method:'POST'}); show(false); };
+$('loginBtn').onclick = async () => {
+  $('loginErr').textContent = '';
+  try {
+    await api('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username:$('u').value, password:$('p').value})});
+    show(true); load(false);
+  } catch (e) { $('loginErr').textContent = e.message; }
+};
+$('p').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+(async () => {
+  const me = await fetch('/api/me').then(r => r.json());
+  if (me.user) { show(true); load(false); } else show(false);
+})();
+</script>
+</body>
+</html>
