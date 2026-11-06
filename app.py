@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -36,7 +37,6 @@ DB = dict(
     charset="utf8mb4",
 )
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "60"))
-SCREEN_ROW_LIMIT = int(os.environ.get("SCREEN_ROW_LIMIT", "1000"))  # rows shown on screen
 
 # APP_USERS="client1:pass1,client2:pass2"
 def _parse_users(raw):
@@ -78,18 +78,41 @@ def _clean(v):
     return v
 
 
+PAGE_SIZE = 25
+_VMARK = re.compile(r"\{\{V:([\w.]+)\}\}")
+_page_cache = {}
+_filter_cache = {"ts": 0, "data": None}
+
+
+def _render_sql(conn, ids=None):
+    """ids=None -> whole report. ids=[...] -> only those villages (one page)."""
+    def sub(m):
+        if ids is None:
+            return ""
+        if not ids:
+            return f"AND {m.group(1)} IN (NULL)"
+        return f"AND {m.group(1)} IN ({','.join(str(conn.escape(i)) for i in ids)})"
+    return _VMARK.sub(sub, SQL)
+
+
+def _run_report(conn, cur, ids=None):
+    cur.execute(_render_sql(conn, ids))  # no args: '%' in the SQL is left untouched
+    columns = [d[0] for d in cur.description]
+    rows = [[_clean(v) for v in r] for r in cur.fetchall()]
+    return columns, rows
+
+
 def fetch_base(force=False):
-    """Run the SQL once (read-only) and cache it briefly. District and block
-    reports are calculated from these panchayat rows, so one query serves all."""
+    """Run the whole report once (read-only) and cache it briefly. Used for the Excel
+    download and the grand total. District and block reports are calculated from these
+    panchayat rows, so one query serves all levels."""
     with _lock:
         if not force and _cache["data"] and time.time() - _cache["ts"] < CACHE_SECONDS:
             return _cache["data"]
         conn = pymysql.connect(**DB)
         try:
             with conn.cursor() as cur:
-                cur.execute(SQL)  # no args: '%' in the SQL is left untouched
-                columns = [d[0] for d in cur.description]
-                rows = [[_clean(v) for v in r] for r in cur.fetchall()]
+                columns, rows = _run_report(conn, cur)
         finally:
             conn.close()
         data = {
@@ -99,6 +122,106 @@ def fetch_base(force=False):
         }
         _cache.update(ts=time.time(), data=data)
         return data
+
+
+def get_filters():
+    """District / block drop-down choices. Cheap query on the panchayat list only."""
+    if _filter_cache["data"] and time.time() - _filter_cache["ts"] < 600:
+        return _filter_cache["data"]
+    conn = pymysql.connect(**DB)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT district_name, block_name FROM gp_data_sfc "
+                        "WHERE villageId NOT IN (299841)")
+            pairs = cur.fetchall()
+    finally:
+        conn.close()
+    blocks = {}
+    for d, b in pairs:
+        if d is not None:
+            blocks.setdefault(d, set())
+            if b is not None:
+                blocks[d].add(b)
+    data = {
+        "districts": sorted(blocks, key=str.lower),
+        "blocks": {d: sorted(bs, key=str.lower) for d, bs in blocks.items()},
+    }
+    _filter_cache.update(ts=time.time(), data=data)
+    return data
+
+
+def get_page(level, district, block, page, fresh=False):
+    """One page (25 rows) of a report level. Only the villages on that page are counted."""
+    key = (level, district, block, page)
+    hit = _page_cache.get(key)
+    if hit and not fresh and time.time() - hit[0] < CACHE_SECONDS:
+        return hit[1]
+
+    where, args = ["villageId NOT IN (299841)"], []
+    if district:
+        where.append("district_name = %s"); args.append(district)
+    if block and level != "district":
+        where.append("block_name = %s"); args.append(block)
+    w = " AND ".join(where)
+    offset = (page - 1) * PAGE_SIZE
+
+    conn = pymysql.connect(**DB)
+    try:
+        with conn.cursor() as cur:
+            if level == "panchayat":
+                cur.execute(f"SELECT COUNT(*) FROM gp_data_sfc WHERE {w}", args)
+                count = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT villageId FROM gp_data_sfc WHERE {w} "
+                    "ORDER BY district_name, block_name, VillageName LIMIT %s OFFSET %s",
+                    args + [PAGE_SIZE, offset])
+                ids = [r[0] for r in cur.fetchall()]
+            else:
+                keys = ["district_name"] + (["block_name"] if level == "block" else [])
+                k = ", ".join(keys)
+                cur.execute(f"SELECT COUNT(*) FROM (SELECT 1 FROM gp_data_sfc WHERE {w} "
+                            f"GROUP BY {k}) t", args)
+                count = cur.fetchone()[0]
+                cur.execute(f"SELECT {k} FROM gp_data_sfc WHERE {w} GROUP BY {k} "
+                            f"ORDER BY {k} LIMIT %s OFFSET %s", args + [PAGE_SIZE, offset])
+                groups = cur.fetchall()
+                ids = []
+                if groups:
+                    cond = " OR ".join(
+                        "(" + " AND ".join(f"{c} <=> %s" for c in keys) + ")" for _ in groups)
+                    params = [v for g in groups for v in g]
+                    cur.execute(f"SELECT villageId FROM gp_data_sfc WHERE {w} AND ({cond})",
+                                args + params)
+                    ids = [r[0] for r in cur.fetchall()]
+            columns, rows = _run_report(conn, cur, ids) if ids else (None, [])
+            if columns is None:  # empty page: still need the column names
+                columns = fetch_columns(conn, cur)
+    finally:
+        conn.close()
+
+    base = {"columns": columns}
+    if level == "district":
+        columns, out = rollup(base, [I_DISTRICT], ["District"], rows); n_label = 1
+    elif level == "block":
+        columns, out = rollup(base, [I_DISTRICT, I_BLOCK], ["District", "Block_name"], rows)
+        n_label = 2
+    else:
+        out, n_label = rows, N_LABEL
+    result = {
+        "columns": columns, "rows": out, "n_label": n_label, "row_count": count,
+        "page": page, "page_size": PAGE_SIZE, "pages": max(1, -(-count // PAGE_SIZE)),
+        "page_total": make_total(level, columns, out, n_label, "Page total"),
+        "generated_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+    }
+    if len(_page_cache) > 300:
+        _page_cache.clear()
+    _page_cache[key] = (time.time(), result)
+    return result
+
+
+def fetch_columns(conn, cur):
+    cur.execute(_render_sql(conn, []))
+    return [d[0] for d in cur.description]
 
 
 def _sort_key(key):
@@ -147,13 +270,21 @@ def build_total(columns, rows, n_label):
     return tot
 
 
+def make_total(level, columns, out, n_label, label="Total"):
+    total = build_total(columns, out, n_label)
+    total[0] = label
+    if level == "panchayat":  # show number of panchayats that started the survey
+        total[I_SURVEY] = f"{sum(1 for r in out if r[I_SURVEY] == 'Yes')} Yes"
+    return total
+
+
 def get_level(level, district=None, block=None, force=False):
     """Returns columns, rows, total, n_label for one report level."""
     base = fetch_base(force)
     rows = base["rows"]
     if district:
         rows = [r for r in rows if r[I_DISTRICT] == district]
-    if block:
+    if block and level != "district":
         rows = [r for r in rows if r[I_BLOCK] == block]
     if level == "district":
         columns, out = rollup(base, [I_DISTRICT], ["District"], rows)
@@ -163,9 +294,7 @@ def get_level(level, district=None, block=None, force=False):
         n_label = 2
     else:
         columns, out, n_label = base["columns"], rows, N_LABEL
-    total = build_total(columns, out, n_label)
-    if level == "panchayat":  # show number of panchayats that started the survey
-        total[I_SURVEY] = f"{sum(1 for r in out if r[I_SURVEY] == 'Yes')} Yes"
+    total = make_total(level, columns, out, n_label)
     return columns, out, total, n_label, base["generated_at"]
 
 
@@ -216,37 +345,45 @@ def _args():
     )
 
 
+@app.get("/api/filters")
+@login_required
+def filters():
+    try:
+        return jsonify(get_filters())
+    except Exception as e:
+        return jsonify(error=f"Could not read the database: {e}"), 500
+
+
 @app.get("/api/report")
 @login_required
 def report():
+    """One page (25 rows) of the selected level."""
     level, district, block, fresh = _args()
+    if level == "all":
+        level = "district"
     try:
-        columns, rows, total, n_label, gen = get_level(
-            level if level != "all" else "district", district, block, fresh
-        )
-        base = fetch_base()
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    try:
+        return jsonify(get_page(level, district, block, page, fresh))
     except Exception as e:  # show a readable message, not a stack trace
         return jsonify(error=f"Could not read the database: {e}"), 500
-    # drop-down choices
-    blocks = {}
-    for r in base["rows"]:
-        blocks.setdefault(r[I_DISTRICT], set()).add(r[I_BLOCK])
-    filters = {
-        "districts": sorted((d for d in blocks if d is not None), key=str.lower),
-        "blocks": {d: sorted((b for b in bs if b is not None), key=str.lower)
-                   for d, bs in blocks.items() if d is not None},
-    }
-    shown = rows[:SCREEN_ROW_LIMIT]
-    return jsonify(
-        columns=columns,
-        rows=shown,
-        total=total,
-        n_label=n_label,
-        row_count=len(rows),
-        truncated=len(rows) > len(shown),
-        generated_at=gen,
-        filters=filters,
-    )
+
+
+@app.get("/api/report/total")
+@login_required
+def report_total():
+    """Grand total over ALL rows of the selection. Slower than a page, so the page
+    asks for it separately and shows the 25 rows first."""
+    level, district, block, fresh = _args()
+    if level == "all":
+        level = "district"
+    try:
+        columns, rows, total, n_label, gen = get_level(level, district, block, fresh)
+    except Exception as e:
+        return jsonify(error=f"Could not read the database: {e}"), 500
+    return jsonify(total=total, row_count=len(rows), n_label=n_label, generated_at=gen)
 
 
 def _write_sheet(wb, title, columns, rows, total, n_label, gen):

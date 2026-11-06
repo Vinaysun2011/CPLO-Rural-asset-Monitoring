@@ -1,3 +1,7 @@
+/* The {{V:column}} markers are filled in by app.py. For one page of results they become
+   "AND column IN (<the 25 villages of that page>)", so every table is read only for those
+   villages (this is what makes the page fast and lets the indexes work). For the full
+   report (Excel / grand total) they become empty. Do not remove them. */
 SELECT
     gds.district_name AS District,
     gds.block_name    AS Block_name,
@@ -52,7 +56,7 @@ LEFT JOIN
                    THEN buid_id END) AS b,
                0 AS s, 0 AS o, 0 AS l, 0 AS g
         FROM sfc_live_test.rad_building_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
         GROUP BY cplo_village_code
 
         UNION ALL
@@ -60,7 +64,7 @@ LEFT JOIN
         /* Street (no approval rules, not counted for "survey started") */
         SELECT cplo_village_code, 0, 0, COUNT(DISTINCT st_id), 0, 0, 0
         FROM sfc_live_test.rad_street_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
         GROUP BY cplo_village_code
 
         UNION ALL
@@ -74,7 +78,7 @@ LEFT JOIN
                    THEN oth_id END),
                0, 0
         FROM sfc_live_test.rad_other_assets_form_tbl
-        WHERE cplo_user_id IS NOT NULL AND oth_avail_stat = 1
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}} AND oth_avail_stat = 1
         GROUP BY cplo_village_code
 
         UNION ALL
@@ -87,7 +91,7 @@ LEFT JOIN
                    THEN id END),
                0
         FROM sfc_live_test.rad_library_form_tbl
-        WHERE cplo_user_id IS NOT NULL AND is_library_available = 1
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}} AND is_library_available = 1
         GROUP BY cplo_village_code
 
         UNION ALL
@@ -99,7 +103,7 @@ LEFT JOIN
                     AND LOWER(TRIM(COALESCE(it_approved_status, ''))) <> 'rejected'
                    THEN id END)
         FROM sfc_live_test.rad_gym_form_tbl
-        WHERE cplo_user_id IS NOT NULL AND is_gym_available = 1
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}} AND is_gym_available = 1
         GROUP BY cplo_village_code
     ) x
     GROUP BY cplo_village_code
@@ -147,7 +151,7 @@ LEFT JOIN
         SELECT DISTINCT cplo_village_code, buid_id AS asset_id,
                _utf8mb4'building' COLLATE utf8mb4_general_ci AS asset_type
         FROM sfc_live_test.rad_building_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
           AND buid_id IS NOT NULL
           AND LOWER(TRIM(COALESCE(gs_approved_status, ''))) <> 'rejected'
           AND LOWER(TRIM(COALESCE(it_approved_status, ''))) <> 'rejected'
@@ -158,7 +162,7 @@ LEFT JOIN
         SELECT DISTINCT cplo_village_code, oth_id,
                _utf8mb4'other asset' COLLATE utf8mb4_general_ci
         FROM sfc_live_test.rad_other_assets_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
           AND oth_id IS NOT NULL
           AND oth_avail_stat = 1
           AND oth_asset_id IN (14, 15, 16, 17, 18, 19)
@@ -170,7 +174,7 @@ LEFT JOIN
         SELECT DISTINCT cplo_village_code, id,
                _utf8mb4'library' COLLATE utf8mb4_general_ci
         FROM sfc_live_test.rad_library_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
           AND id IS NOT NULL
           AND is_library_available = 1
           AND LOWER(TRIM(COALESCE(gs_approved_status, ''))) <> 'rejected'
@@ -181,7 +185,7 @@ LEFT JOIN
         SELECT DISTINCT cplo_village_code, id,
                _utf8mb4'gym' COLLATE utf8mb4_general_ci
         FROM sfc_live_test.rad_gym_form_tbl
-        WHERE cplo_user_id IS NOT NULL
+        WHERE cplo_user_id IS NOT NULL {{V:cplo_village_code}}
           AND id IS NOT NULL
           AND is_gym_available = 1
           AND LOWER(TRIM(COALESCE(gs_approved_status, ''))) <> 'rejected'
@@ -191,11 +195,12 @@ LEFT JOIN
         AND e.asset_id          = r.asset_id
         AND e.asset_type        = CONVERT(r.asset_type USING utf8mb4) COLLATE utf8mb4_general_ci
 
+    WHERE 1 = 1 {{V:r.village_code}}
     GROUP BY r.village_code
 ) rk
     ON rk.village_code = gds.villageId
 
-WHERE gds.villageId NOT IN (299841)
+WHERE gds.villageId NOT IN (299841) {{V:gds.villageId}}
 
 ORDER BY
     gds.district_name,

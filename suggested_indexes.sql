@@ -8,3 +8,4 @@ CREATE INDEX idx_lib_vil  ON sfc_live_test.rad_library_form_tbl      (cplo_villa
 CREATE INDEX idx_gym_vil  ON sfc_live_test.rad_gym_form_tbl          (cplo_village_code, cplo_user_id, id);
 CREATE INDEX idx_rank_vil ON rad_asset_ranking_tbl (village_code, asset_id);
 CREATE INDEX idx_gp_vil   ON gp_data_sfc (villageId);
+CREATE INDEX idx_gp_geo   ON gp_data_sfc (district_name, block_name, VillageName, villageId);  -- speeds up the 25-row page lookup

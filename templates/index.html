@@ -27,6 +27,8 @@
   th { position:sticky; top:0; background:var(--blue); color:#fff; white-space:normal; text-align:center; min-width:110px; z-index:1; }
   td.l, th.l { text-align:left; }
   tr.total td { font-weight:700; background:#ddebf7; position:sticky; bottom:0; }
+  tr.ptotal td { font-weight:600; background:#eef4fa; }
+  .pager { display:flex; gap:10px; align-items:center; margin-top:12px; font-size:14px; }
   tbody tr:hover td { background:#f1f7fd; }
   .card { max-width:340px; margin:80px auto; background:#fff; padding:28px; border-radius:10px; border:1px solid var(--line); }
   .card h2 { margin-top:0; }
@@ -69,6 +71,11 @@
     <div id="note" class="note hidden"></div>
     <div id="error" class="err"></div>
     <div class="wrap"><table id="tbl"></table></div>
+    <div class="pager" id="pager">
+      <button class="secondary" id="prevBtn" disabled>&larr; Previous</button>
+      <span id="pageInfo" class="muted"></span>
+      <button class="secondary" id="nextBtn" disabled>Next &rarr;</button>
+    </div>
   </main>
 </div>
 
@@ -76,7 +83,7 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = v => typeof v === 'number' ? v.toLocaleString('en-IN') : esc(v);
-let level = 'district', filters = null, busy = false;
+let level = 'district', filters = null, busy = false, page = 1, pages = 1, totalToken = 0;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -115,33 +122,50 @@ function render(d) {
   const idCol = d.columns.indexOf('PanchayatId');
   const row = (r, cls) => `<tr class="${cls || ''}">` + r.map((v, i) =>
       `<td class="${i < n ? 'l' : ''}">${i === idCol ? esc(v) : fmt(v)}</td>`).join('') + '</tr>';
-  $('tbl').innerHTML = `<thead><tr>${th}</tr></thead><tbody>${d.rows.map(r => row(r)).join('')}${row(d.total, 'total')}</tbody>`;
-  $('status').textContent = `${d.row_count.toLocaleString('en-IN')} rows - data as of ${d.generated_at}`;
-  const note = $('note');
-  if (d.truncated) {
-    note.textContent = `Showing the first ${d.rows.length.toLocaleString('en-IN')} of ${d.row_count.toLocaleString('en-IN')} panchayats. Pick a district or block above to narrow it down, or download the Excel file to get every row. The Total row covers all ${d.row_count.toLocaleString('en-IN')}.`;
-    note.classList.remove('hidden');
-  } else note.classList.add('hidden');
+  const empty = `<tr class="total" id="grandRow"><td class="l" colspan="${d.columns.length}">Grand total: calculating...</td></tr>`;
+  $('tbl').innerHTML = `<thead><tr>${th}</tr></thead><tbody>${d.rows.map(r => row(r)).join('')}${row(d.page_total, 'ptotal')}${empty}</tbody>`;
+  page = d.page; pages = d.pages;
+  const from = d.row_count ? (d.page - 1) * d.page_size + 1 : 0, to = from ? from + d.rows.length - 1 : 0;
+  $('pageInfo').textContent = `Page ${d.page} of ${d.pages} (rows ${from}-${to} of ${d.row_count.toLocaleString('en-IN')})`;
+  $('prevBtn').disabled = d.page <= 1; $('nextBtn').disabled = d.page >= d.pages;
+  $('status').textContent = `data as of ${d.generated_at}`;
   $('xlsBtn').disabled = $('xlsAllBtn').disabled = false;
+  loadTotal(d, row);
+}
+async function loadTotal(d, row) {
+  const token = ++totalToken;
+  try {
+    const t = await api('/api/report/total?' + qs());
+    if (token !== totalToken) return;
+    const g = $('grandRow'); if (!g) return;
+    g.outerHTML = row(['Grand total (all ' + t.row_count.toLocaleString('en-IN') + ')', ...t.total.slice(1)], 'total');
+  } catch (e) {
+    if (token !== totalToken) return;
+    const g = $('grandRow');
+    if (g) g.innerHTML = `<td class="l" colspan="${d.columns.length}">Grand total unavailable (${esc(e.message)}). The 25 rows above are correct; the Excel download has every row.</td>`;
+  }
 }
 async function load(fresh) {
   if (busy) return;
   busy = true; $('error').textContent = '';
-  $('refreshBtn').disabled = true; $('status').textContent = 'Loading from database...';
+  $('refreshBtn').disabled = $('prevBtn').disabled = $('nextBtn').disabled = true;
+  $('status').textContent = 'Loading from database...';
   try {
-    const d = await api('/api/report?' + qs(fresh ? {fresh: 1} : {}));
-    if (!filters) fillFilters(d.filters);
-    render(d);
+    if (!filters) fillFilters(await api('/api/filters'));
+    render(await api('/api/report?' + qs({page, ...(fresh ? {fresh: 1} : {})})));
   } catch (e) { $('error').textContent = e.message; $('status').textContent = ''; }
   busy = false; $('refreshBtn').disabled = false;
+  $('prevBtn').disabled = page <= 1; $('nextBtn').disabled = page >= pages;
 }
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
-  t.classList.add('on'); level = t.dataset.level; fillBlocks(); load(false);
+  t.classList.add('on'); level = t.dataset.level; page = 1; fillBlocks(); load(false);
 });
-$('fDistrict').onchange = () => { fillBlocks(); load(false); };
-$('fBlock').onchange = () => load(false);
-$('refreshBtn').onclick = async () => { filters = null; await load(true); };
+$('fDistrict').onchange = () => { page = 1; fillBlocks(); load(false); };
+$('fBlock').onchange = () => { page = 1; load(false); };
+$('prevBtn').onclick = () => { if (page > 1) { page--; load(false); } };
+$('nextBtn').onclick = () => { if (page < pages) { page++; load(false); } };
+$('refreshBtn').onclick = async () => { filters = null; page = 1; await load(true); };
 $('xlsBtn').onclick = () => { location.href = '/api/report.xlsx?' + qs(); };
 $('xlsAllBtn').onclick = () => { location.href = '/api/report.xlsx?' + qs({level: 'all'}); };
 $('logoutBtn').onclick = async () => { await api('/api/logout', {method:'POST'}); show(false); };

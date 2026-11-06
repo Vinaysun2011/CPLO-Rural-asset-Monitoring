@@ -40,8 +40,10 @@ Three tabs: **District wise**, **Block wise**, **Panchayat wise**. Pick a distri
 - `report.sql` is the panchayat-wise query (one row per panchayat). Block and district totals are
   added up from those rows, so one database query feeds all three levels.
 - **Download Excel (this tab)** gives the current level; **Download Excel (all 3 levels)** gives one file
-  with three sheets. Filters apply to both. The Excel file always has every row; the screen shows the
-  first 1,000 panchayats (set `SCREEN_ROW_LIMIT` to change).
+  with three sheets. Filters apply to both. The Excel file always has every row.
+- The screen shows **25 rows per page** (Previous / Next). Only the villages on the current page are counted in
+  the database, so a page loads fast. The **Grand total** row loads separately after the page; if it is too slow
+  it says so, and the 25 rows are still correct. The Excel download runs the full report (slower).
 - `report_original_panchayat.sql` is your original query; `old_queries/` holds the earlier district query.
 - `suggested_indexes.sql` lists indexes that make the query faster (ask your DBA to run them).
 
