@@ -40,12 +40,17 @@ SCREEN_ROW_LIMIT = int(os.environ.get("SCREEN_ROW_LIMIT", "1000"))  # rows shown
 
 # APP_USERS="client1:pass1,client2:pass2"
 def _parse_users(raw):
-    raw = raw.strip().strip("\"'")
     users = {}
-    for pair in raw.replace("\n", ",").split(","):
-        if ":" in pair:
-            u, p = pair.split(":", 1)
-            users[u.strip().strip("\"'")] = p.strip().strip("\"'")
+    for line in raw.replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue  # skip blank lines and comment lines pasted from .env
+        if line.upper().startswith("APP_USERS="):
+            line = line.split("=", 1)[1]  # value pasted together with its name
+        for pair in line.split(","):
+            if ":" in pair:
+                u, p = pair.split(":", 1)
+                users[u.strip().strip("\"'")] = p.strip().strip("\"'")
     return users
 
 
