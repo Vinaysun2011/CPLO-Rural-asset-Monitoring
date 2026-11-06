@@ -78,10 +78,25 @@ def _clean(v):
     return v
 
 
-PAGE_SIZE = 25
+DEFAULT_PAGE_SIZE = int(os.environ.get("DEFAULT_PAGE_SIZE", "5"))
+MAX_PAGE_SIZE = int(os.environ.get("MAX_PAGE_SIZE", "100"))
+PAGE_SIZE = DEFAULT_PAGE_SIZE
 _VMARK = re.compile(r"\{\{V:([\w.]+)\}\}")
 _page_cache = {}
 _filter_cache = {"ts": 0, "data": None}
+
+
+def normalize_page_size(value, default=DEFAULT_PAGE_SIZE):
+    """Normalize page-size requests to a safe integer in the supported range."""
+    try:
+        page_size = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        page_size = default
+    if page_size < 1:
+        page_size = default
+    if page_size > MAX_PAGE_SIZE:
+        page_size = MAX_PAGE_SIZE
+    return page_size
 
 
 def _render_sql(conn, ids=None):
@@ -150,20 +165,27 @@ def get_filters():
     return data
 
 
-def get_page(level, district, block, page, fresh=False):
-    """One page (25 rows) of a report level. Only the villages on that page are counted."""
-    key = (level, district, block, page)
+def get_page(level, district, block, page, fresh=False, page_size=None):
+    """One page of a report level. Only the villages on that page are counted."""
+    page_size = normalize_page_size(page_size, DEFAULT_PAGE_SIZE)
+    district_values = _normalize_list(district)
+    block_values = _normalize_list(block)
+    key = (level, tuple(district_values), tuple(block_values), page, page_size)
     hit = _page_cache.get(key)
     if hit and not fresh and time.time() - hit[0] < CACHE_SECONDS:
         return hit[1]
 
     where, args = ["villageId NOT IN (299841)"], []
-    if district:
-        where.append("district_name = %s"); args.append(district)
-    if block and level != "district":
-        where.append("block_name = %s"); args.append(block)
+    if district_values:
+        placeholders = ", ".join(["%s"] * len(district_values))
+        where.append(f"district_name IN ({placeholders})")
+        args.extend(district_values)
+    if block_values:
+        placeholders = ", ".join(["%s"] * len(block_values))
+        where.append(f"block_name IN ({placeholders})")
+        args.extend(block_values)
     w = " AND ".join(where)
-    offset = (page - 1) * PAGE_SIZE
+    offset = (page - 1) * page_size
 
     conn = pymysql.connect(**DB)
     try:
@@ -174,7 +196,7 @@ def get_page(level, district, block, page, fresh=False):
                 cur.execute(
                     f"SELECT villageId FROM gp_data_sfc WHERE {w} "
                     "ORDER BY district_name, block_name, VillageName LIMIT %s OFFSET %s",
-                    args + [PAGE_SIZE, offset])
+                    args + [page_size, offset])
                 ids = [r[0] for r in cur.fetchall()]
             else:
                 keys = ["district_name"] + (["block_name"] if level == "block" else [])
@@ -183,7 +205,7 @@ def get_page(level, district, block, page, fresh=False):
                             f"GROUP BY {k}) t", args)
                 count = cur.fetchone()[0]
                 cur.execute(f"SELECT {k} FROM gp_data_sfc WHERE {w} GROUP BY {k} "
-                            f"ORDER BY {k} LIMIT %s OFFSET %s", args + [PAGE_SIZE, offset])
+                            f"ORDER BY {k} LIMIT %s OFFSET %s", args + [page_size, offset])
                 groups = cur.fetchall()
                 ids = []
                 if groups:
@@ -209,7 +231,7 @@ def get_page(level, district, block, page, fresh=False):
         out, n_label = rows, N_LABEL
     result = {
         "columns": columns, "rows": out, "n_label": n_label, "row_count": count,
-        "page": page, "page_size": PAGE_SIZE, "pages": max(1, -(-count // PAGE_SIZE)),
+        "page": page, "page_size": page_size, "pages": max(1, -(-count // page_size)),
         "page_total": make_total(level, columns, out, n_label, "Page total"),
         "generated_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
     }
@@ -279,13 +301,28 @@ def make_total(level, columns, out, n_label, label="Total"):
 
 
 def get_level(level, district=None, block=None, force=False):
-    """Returns columns, rows, total, n_label for one report level."""
-    base = fetch_base(force)
-    rows = base["rows"]
-    if district:
-        rows = [r for r in rows if r[I_DISTRICT] == district]
-    if block and level != "district":
-        rows = [r for r in rows if r[I_BLOCK] == block]
+    """Return a filtered report and total, aggregating only selected villages."""
+    district_values = _normalize_list(district)
+    block_values = _normalize_list(block)
+    where, args = ["villageId NOT IN (299841)"], []
+    for column, values in (("district_name", district_values), ("block_name", block_values)):
+        if values:
+            placeholders = ", ".join(["%s"] * len(values))
+            where.append(f"{column} IN ({placeholders})")
+            args.extend(values)
+    conn = pymysql.connect(**DB)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT villageId FROM gp_data_sfc WHERE " + " AND ".join(where), args)
+            ids = [row[0] for row in cur.fetchall()]
+            if ids:
+                columns, rows = _run_report(conn, cur, ids)
+            else:
+                columns, rows = _run_report(conn, cur, [])
+    finally:
+        conn.close()
+    base = {"columns": columns, "rows": rows,
+            "generated_at": datetime.now().strftime("%d-%b-%Y %H:%M:%S")}
     if level == "district":
         columns, out = rollup(base, [I_DISTRICT], ["District"], rows)
         n_label = 1
@@ -333,14 +370,36 @@ def me():
     return jsonify(user=session.get("user"))
 
 
+def _normalize_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = [value]
+    out = []
+    for item in values:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            pieces = item.split(",")
+        else:
+            pieces = [str(item)]
+        for piece in pieces:
+            piece = piece.strip()
+            if piece:
+                out.append(piece)
+    return out
+
+
 def _args():
     level = request.args.get("level", "district")
     if level not in LEVELS and level != "all":
         level = "district"
     return (
         level,
-        request.args.get("district") or None,
-        request.args.get("block") or None,
+        _normalize_list(request.args.getlist("district")),
+        _normalize_list(request.args.getlist("block")),
         request.args.get("fresh") == "1",
     )
 
@@ -357,16 +416,19 @@ def filters():
 @app.get("/api/report")
 @login_required
 def report():
-    """One page (25 rows) of the selected level."""
+    """One page of the selected level with a safe page-size limit."""
     level, district, block, fresh = _args()
     if level == "all":
         level = "district"
+    if not district and not block:
+        return jsonify(error="Select at least one district or block."), 400
     try:
         page = max(1, int(request.args.get("page", "1")))
     except ValueError:
         page = 1
+    page_size = normalize_page_size(request.args.get("page_size"), DEFAULT_PAGE_SIZE)
     try:
-        return jsonify(get_page(level, district, block, page, fresh))
+        return jsonify(get_page(level, district or request.args.getlist("district"), block or request.args.getlist("block"), page, fresh, page_size=page_size))
     except Exception as e:  # show a readable message, not a stack trace
         return jsonify(error=f"Could not read the database: {e}"), 500
 
@@ -379,6 +441,8 @@ def report_total():
     level, district, block, fresh = _args()
     if level == "all":
         level = "district"
+    if not district and not block:
+        return jsonify(error="Select at least one district or block."), 400
     try:
         columns, rows, total, n_label, gen = get_level(level, district, block, fresh)
     except Exception as e:
@@ -440,6 +504,8 @@ def _write_sheet(wb, title, columns, rows, total, n_label, gen):
 @login_required
 def report_xlsx():
     level, district, block, fresh = _args()
+    if not district and not block:
+        return jsonify(error="Select at least one district or block."), 400
     levels = list(LEVELS) if level == "all" else [level]
     wb = Workbook(write_only=True)
     try:

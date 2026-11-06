@@ -15,7 +15,10 @@
   .tab { background:#fff; color:var(--blue); border:1px solid var(--blue); padding:8px 18px; border-radius:6px; font-size:14px; cursor:pointer; }
   .tab.on { background:var(--blue); color:#fff; }
   .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .filter-control { display:flex; flex-direction:column; gap:4px; }
+  .filter-control label { color:#444; font-size:13px; font-weight:600; }
   select { padding:8px 10px; border:1px solid #bbb; border-radius:6px; font-size:14px; background:#fff; max-width:220px; }
+  select[multiple] { width:220px; }
   button { background:var(--blue); color:#fff; border:0; padding:9px 16px; border-radius:6px; font-size:14px; cursor:pointer; }
   button.secondary { background:#fff; color:var(--blue); border:1px solid var(--blue); }
   button:disabled { opacity:.5; cursor:default; }
@@ -61,9 +64,24 @@
       <button class="tab" data-level="panchayat">Panchayat wise</button>
     </div>
     <div class="bar">
-      <select id="fDistrict"><option value="">All districts</option></select>
-      <select id="fBlock"><option value="">All blocks</option></select>
+      <div class="filter-control">
+        <label for="fDistrict">Districts</label>
+        <select id="fDistrict" multiple size="6" title="Select one or more districts"></select>
+      </div>
+      <div class="filter-control">
+        <label for="fBlock">Blocks</label>
+        <select id="fBlock" multiple size="6" title="Select one or more blocks"></select>
+      </div>
+      <label class="muted" for="pageSize">Rows/page</label>
+      <select id="pageSize">
+        <option value="5" selected>5</option>
+        <option value="10">10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
       <button id="refreshBtn">Generate / Refresh</button>
+      <button id="totalBtn" class="secondary" disabled>Show total</button>
       <button id="xlsBtn" class="secondary" disabled>Download Excel (this tab)</button>
       <button id="xlsAllBtn" class="secondary" disabled>Download Excel (all 3 levels)</button>
       <span class="muted" id="status"></span>
@@ -96,25 +114,41 @@ function show(loggedIn) {
   $('loginView').classList.toggle('hidden', loggedIn);
   $('appView').classList.toggle('hidden', !loggedIn);
 }
+function getSelectedValues(selectEl) {
+  if (!selectEl) return [];
+  return Array.from(selectEl.selectedOptions).map(opt => opt.value).filter(Boolean);
+}
 function qs(extra = {}) {
-  const p = new URLSearchParams({level, ...extra});
-  if ($('fDistrict').value) p.set('district', $('fDistrict').value);
-  if ($('fBlock').value && level !== 'district') p.set('block', $('fBlock').value);
+  const p = new URLSearchParams({level, page_size: $('pageSize').value || '25', ...extra});
+  for (const v of getSelectedValues($('fDistrict'))) p.append('district', v);
+  if (level !== 'district') {
+    for (const v of getSelectedValues($('fBlock'))) p.append('block', v);
+  }
   return p.toString();
 }
 function fillFilters(f) {
   filters = f;
-  const d = $('fDistrict'), keep = d.value;
-  d.innerHTML = '<option value="">All districts</option>' + f.districts.map(x => `<option>${esc(x)}</option>`).join('');
-  d.value = f.districts.includes(keep) ? keep : '';
+  const d = $('fDistrict');
+  const keep = getSelectedValues(d);
+  d.innerHTML = f.districts.map(x => `<option>${esc(x)}</option>`).join('');
+  for (const x of keep) {
+    const opt = Array.from(d.options).find(o => o.value === x);
+    if (opt) opt.selected = true;
+  }
   fillBlocks();
 }
 function fillBlocks() {
-  const b = $('fBlock'), keep = b.value, d = $('fDistrict').value;
-  const list = d ? (filters.blocks[d] || []) : [];
-  b.innerHTML = '<option value="">All blocks</option>' + list.map(x => `<option>${esc(x)}</option>`).join('');
-  b.value = list.includes(keep) ? keep : '';
-  b.disabled = !d || level === 'district';
+  const b = $('fBlock');
+  const keep = getSelectedValues(b);
+  const districtValues = getSelectedValues($('fDistrict'));
+  const list = districtValues.length ? districtValues.flatMap(d => filters.blocks[d] || []) : [];
+  const unique = [...new Set(list)];
+  b.innerHTML = unique.map(x => `<option>${esc(x)}</option>`).join('');
+  for (const x of keep) {
+    const opt = Array.from(b.options).find(o => o.value === x);
+    if (opt) opt.selected = true;
+  }
+  b.disabled = !districtValues.length || level === 'district';
 }
 function render(d) {
   const n = d.n_label;
@@ -122,50 +156,79 @@ function render(d) {
   const idCol = d.columns.indexOf('PanchayatId');
   const row = (r, cls) => `<tr class="${cls || ''}">` + r.map((v, i) =>
       `<td class="${i < n ? 'l' : ''}">${i === idCol ? esc(v) : fmt(v)}</td>`).join('') + '</tr>';
-  const empty = `<tr class="total" id="grandRow"><td class="l" colspan="${d.columns.length}">Grand total: calculating...</td></tr>`;
+  const empty = `<tr class="total" id="grandRow"><td class="l" colspan="${d.columns.length}">Grand total is loaded on demand.</td></tr>`;
   $('tbl').innerHTML = `<thead><tr>${th}</tr></thead><tbody>${d.rows.map(r => row(r)).join('')}${row(d.page_total, 'ptotal')}${empty}</tbody>`;
   page = d.page; pages = d.pages;
-  const from = d.row_count ? (d.page - 1) * d.page_size + 1 : 0, to = from ? from + d.rows.length - 1 : 0;
+  const from = d.row_count ? (d.page - 1) * d.page_size + 1 : 0; 
+  const to = from ? Math.min(from + d.rows.length - 1, d.row_count) : 0;
   $('pageInfo').textContent = `Page ${d.page} of ${d.pages} (rows ${from}-${to} of ${d.row_count.toLocaleString('en-IN')})`;
   $('prevBtn').disabled = d.page <= 1; $('nextBtn').disabled = d.page >= d.pages;
   $('status').textContent = `data as of ${d.generated_at}`;
-  $('xlsBtn').disabled = $('xlsAllBtn').disabled = false;
-  loadTotal(d, row);
+  $('xlsBtn').disabled = $('xlsAllBtn').disabled = $('totalBtn').disabled = false;
 }
 async function loadTotal(d, row) {
   const token = ++totalToken;
+  $('totalBtn').disabled = true;
   try {
     const t = await api('/api/report/total?' + qs());
     if (token !== totalToken) return;
     const g = $('grandRow'); if (!g) return;
-    g.outerHTML = row(['Grand total (all ' + t.row_count.toLocaleString('en-IN') + ')', ...t.total.slice(1)], 'total');
+    const rowHtml = row(['Grand total (all ' + t.row_count.toLocaleString('en-IN') + ')', ...t.total.slice(1)], 'total');
+    g.outerHTML = rowHtml;
   } catch (e) {
     if (token !== totalToken) return;
     const g = $('grandRow');
-    if (g) g.innerHTML = `<td class="l" colspan="${d.columns.length}">Grand total unavailable (${esc(e.message)}). The 25 rows above are correct; the Excel download has every row.</td>`;
+    if (g) g.innerHTML = `<td class="l" colspan="${d.columns.length}">Grand total unavailable (${esc(e.message)}). The current page is still correct.</td>`;
+  } finally {
+    $('totalBtn').disabled = false;
   }
 }
 async function load(fresh) {
   if (busy) return;
   busy = true; $('error').textContent = '';
-  $('refreshBtn').disabled = $('prevBtn').disabled = $('nextBtn').disabled = true;
-  $('status').textContent = 'Loading from database...';
   try {
     if (!filters) fillFilters(await api('/api/filters'));
+    const selectedDistricts = getSelectedValues($('fDistrict'));
+    const selectedBlocks = getSelectedValues($('fBlock'));
+    if (!selectedDistricts.length && !selectedBlocks.length) {
+      $('tbl').innerHTML = '<thead></thead><tbody><tr><td class="l">Select at least one district or block to load data.</td></tr></tbody>';
+      $('status').textContent = 'No filter selected';
+      $('pageInfo').textContent = 'Waiting for filter selection';
+      return;
+    }
+    $('refreshBtn').disabled = $('prevBtn').disabled = $('nextBtn').disabled = true;
+    $('status').textContent = 'Loading from database...';
     render(await api('/api/report?' + qs({page, ...(fresh ? {fresh: 1} : {})})));
   } catch (e) { $('error').textContent = e.message; $('status').textContent = ''; }
-  busy = false; $('refreshBtn').disabled = false;
-  $('prevBtn').disabled = page <= 1; $('nextBtn').disabled = page >= pages;
+  finally {
+    busy = false; $('refreshBtn').disabled = false;
+    $('prevBtn').disabled = page <= 1; $('nextBtn').disabled = page >= pages;
+  }
 }
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
-  t.classList.add('on'); level = t.dataset.level; page = 1; fillBlocks(); load(false);
+  t.classList.add('on'); level = t.dataset.level; page = 1; fillBlocks();
+  if (!getSelectedValues($('fDistrict')).length && !getSelectedValues($('fBlock')).length) {
+    $('tbl').innerHTML = '<thead></thead><tbody><tr><td class="l">Select at least one district or block to load data.</td></tr></tbody>';
+    $('pageInfo').textContent = 'Waiting for filter selection';
+    $('status').textContent = 'No filter selected';
+    return;
+  }
+  load(false);
 });
-$('fDistrict').onchange = () => { page = 1; fillBlocks(); load(false); };
-$('fBlock').onchange = () => { page = 1; load(false); };
+$('fDistrict').onchange = () => { page = 1; fillBlocks(); if (getSelectedValues($('fDistrict')).length || getSelectedValues($('fBlock')).length) load(false); else { $('tbl').innerHTML = '<thead></thead><tbody><tr><td class="l">Select at least one district or block to load data.</td></tr></tbody>'; $('status').textContent = 'No filter selected'; $('pageInfo').textContent = 'Waiting for filter selection'; } };
+$('fBlock').onchange = () => { page = 1; if (getSelectedValues($('fDistrict')).length || getSelectedValues($('fBlock')).length) load(false); else { $('tbl').innerHTML = '<thead></thead><tbody><tr><td class="l">Select at least one district or block to load data.</td></tr></tbody>'; $('status').textContent = 'No filter selected'; $('pageInfo').textContent = 'Waiting for filter selection'; } };
+$('pageSize').onchange = () => { page = 1; if (getSelectedValues($('fDistrict')).length || getSelectedValues($('fBlock')).length) load(false); };
 $('prevBtn').onclick = () => { if (page > 1) { page--; load(false); } };
 $('nextBtn').onclick = () => { if (page < pages) { page++; load(false); } };
 $('refreshBtn').onclick = async () => { filters = null; page = 1; await load(true); };
+$('totalBtn').onclick = () => {
+  const row = (r, cls) => `<tr class="${cls || ''}">` + r.map((v, i) => `<td class="${i < 0 ? 'l' : ''}">${fmt(v)}</td>`).join('') + '</tr>';
+  const current = $('tbl').querySelector('thead tr');
+  const cols = current ? current.children.length : 1;
+  const d = { columns: Array.from({ length: cols }, (_, i) => `Col${i + 1}`) };
+  loadTotal(d, row);
+};
 $('xlsBtn').onclick = () => { location.href = '/api/report.xlsx?' + qs(); };
 $('xlsAllBtn').onclick = () => { location.href = '/api/report.xlsx?' + qs({level: 'all'}); };
 $('logoutBtn').onclick = async () => { await api('/api/logout', {method:'POST'}); show(false); };
