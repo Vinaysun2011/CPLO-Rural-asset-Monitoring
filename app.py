@@ -39,9 +39,17 @@ CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "60"))
 SCREEN_ROW_LIMIT = int(os.environ.get("SCREEN_ROW_LIMIT", "1000"))  # rows shown on screen
 
 # APP_USERS="client1:pass1,client2:pass2"
-USERS = dict(
-    pair.split(":", 1) for pair in os.environ.get("APP_USERS", "").split(",") if ":" in pair
-)
+def _parse_users(raw):
+    raw = raw.strip().strip("\"'")
+    users = {}
+    for pair in raw.replace("\n", ",").split(","):
+        if ":" in pair:
+            u, p = pair.split(":", 1)
+            users[u.strip().strip("\"'")] = p.strip().strip("\"'")
+    return users
+
+
+USERS = _parse_users(os.environ.get("APP_USERS", ""))
 
 with open(os.path.join(os.path.dirname(__file__), "report.sql"), encoding="utf-8") as f:
     SQL = f.read()
